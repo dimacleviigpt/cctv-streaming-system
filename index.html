@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>CCTV</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:100%;height:100%;background:#000;overflow:hidden}
+  .grid{display:grid;gap:3px;width:100vw;height:100vh}
+  .cam{position:relative;background:#0a0a0a;overflow:hidden;cursor:pointer}
+  .cam img{width:100%;height:100%;object-fit:cover;display:block;image-rendering:auto;will-change:contents}
+  .cam-label{position:absolute;bottom:0;left:0;right:0;padding:3px 6px;
+    background:linear-gradient(transparent,rgba(0,0,0,0.65));
+    font-family:monospace;font-size:10px;color:rgba(255,255,255,0.5);pointer-events:none}
+  .cam-err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+    font-family:monospace;font-size:10px;color:#333;pointer-events:none}
+  #fs{display:none;position:fixed;inset:0;background:#000;z-index:100;
+    align-items:center;justify-content:center}
+  #fs.active{display:flex}
+  #fs canvas{width:100vw;height:100vh;object-fit:fill;display:block;cursor:pointer}
+  #fs-spinner{display:none;position:absolute;inset:0;
+    align-items:center;justify-content:center;background:#000;pointer-events:none}
+  #fs-spinner.show{display:flex}
+  .spinner-ring{width:160px;height:160px;border:12px solid #333;border-top-color:#aaa;
+    border-radius:50%;animation:spin 0.7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  #fs-close{display:none;position:absolute;top:12px;right:16px;
+    color:rgba(255,255,255,0.4);font-size:28px;cursor:pointer;
+    font-family:monospace;z-index:10;line-height:1;user-select:none}
+  #fs.active #fs-close{display:block}
+  #fs-close:hover{color:rgba(255,255,255,0.8)}
+  #fs-controls{
+    display:none;position:absolute;right:16px;top:50%;transform:translateY(-50%);
+    flex-direction:column;align-items:center;gap:12px;z-index:10
+  }
+  #fs.active #fs-controls{display:flex}
+  #fs-mute{
+    background:none;border:none;cursor:pointer;
+    color:rgba(255,255,255,0.5);font-size:22px;line-height:1;
+    padding:4px;transition:color 0.2s
+  }
+  #fs-mute:hover{color:rgba(255,255,255,0.9)}
+  #fs-mute.muted{color:#e53e3e}
+  #fs-volume{
+    -webkit-appearance:none;appearance:none;
+    writing-mode:vertical-lr;direction:rtl;
+    width:28px;height:160px;
+    background:transparent;cursor:pointer;outline:none
+  }
+  #fs-volume::-webkit-slider-runnable-track{
+    width:4px;background:rgba(255,255,255,0.2);border-radius:2px
+  }
+  #fs-volume::-webkit-slider-thumb{
+    -webkit-appearance:none;width:16px;height:16px;border-radius:50%;
+    background:#fff;margin-left:-6px;cursor:pointer
+  }
+  #fs-vol-label{
+    color:rgba(255,255,255,0.4);font-family:monospace;font-size:10px
+  }
+  #server-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);
+    z-index:50;align-items:center;justify-content:center;pointer-events:none}
+  #server-overlay.show{display:flex}
+  #server-overlay-text{color:#e53e3e;font-family:monospace;font-weight:bold;
+    font-size:clamp(48px,8vw,128px);text-align:center;
+    text-shadow:0 0 40px rgba(229,62,62,0.6);padding:20px}
+  #loading{position:fixed;inset:0;background:#000;display:flex;
+    align-items:center;justify-content:center;
+    color:#333;font-family:monospace;font-size:12px;z-index:200}
+</style>
+</head>
+<body>
+<div id="loading">подключение к серверу...</div>
+<div class="grid" id="grid"></div>
+<div id="server-overlay"><div id="server-overlay-text"></div></div>
+<div id="fs">
+  <canvas id="fs-canvas"></canvas>
+  <div id="fs-spinner"><div class="spinner-ring"></div></div>
+  <div id="fs-close">&#10005;</div>
+  <div id="fs-controls">
+    <button id="fs-mute" title="Вкл/выкл звук">&#128266;</button>
+    <input id="fs-volume" type="range" min="-20" max="20" value="0" step="1" title="Громкость">
+    <div id="fs-vol-label">0 dB</div>
+  </div>
+</div>
+<script>
+const CONTROL   = "http://localhost:8080";
+const WS_BASE   = "ws://localhost:8080";
+const screen_id = new URLSearchParams(window.location.search).get("screen") || "0";
+
+// ── G.711 декодеры ────────────────────────────────────────────────────────────
+function decodeMulaw(bytes) {
+  const out = new Float32Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    let b = ~bytes[i] & 0xFF;
+    const sign = (b & 0x80) !== 0;
+    const exp  = (b >> 4) & 0x07;
+    const mant = b & 0x0F;
+    let val = ((mant << 1) + 33) << exp;
+    val -= 33;
+    out[i] = (sign ? -val : val) / 32768.0;
+  }
+  return out;
+}
+function decodeAlaw(bytes) {
+  const out = new Float32Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    let b = bytes[i] ^ 0x55;
+    const sign = (b & 0x80) !== 0;
+    const exp  = (b >> 4) & 0x07;
+    const mant = b & 0x0F;
+    let val = exp === 0 ? (mant << 1) + 1 : ((mant | 0x10) << 1 | 1) << (exp - 1);
+    out[i] = (sign ? val : -val) / 4096.0;  // alaw максимум 4096
+  }
+  return out;
+}
+
+// ── H264 codec string из SPS ──────────────────────────────────────────────────
+function h264Codec(nalData) {
+  const a = nalData instanceof ArrayBuffer ? new Uint8Array(nalData) : nalData;
+  for (let i = 0; i < a.length - 5; i++) {
+    if (a[i]===0 && a[i+1]===0 && a[i+2]===0 && a[i+3]===1 && (a[i+4]&0x1F)===7 && i+7<a.length) {
+      return `avc1.${a[i+5].toString(16).padStart(2,'0')}${a[i+6].toString(16).padStart(2,'0')}${a[i+7].toString(16).padStart(2,'0')}`;
+    }
+  }
+  return "avc1.42E028";
+}
+
+// ── Инит ──────────────────────────────────────────────────────────────────────
+async function init() {
+  let cfg;
+  while (true) {
+    try { const r=await fetch(`${CONTROL}/config?screen=${screen_id}`); cfg=await r.json(); break; }
+    catch(e) { document.getElementById("loading").textContent="ожидание сервера..."; await sleep(2000); }
+  }
+  document.getElementById("loading").style.display="none";
+  document.title=`CCTV — экран ${cfg.screen_id}`;
+  build(cfg);
+}
+
+function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+
+function build(cfg) {
+  const {cameras, grid} = cfg;
+  const gridEl = document.getElementById("grid");
+  gridEl.style.gridTemplateColumns=`repeat(${grid.columns},1fr)`;
+  gridEl.style.gridTemplateRows=`repeat(${grid.rows},1fr)`;
+
+  const fs       = document.getElementById("fs");
+  const fsCanvas = document.getElementById("fs-canvas");
+  const fsCtx    = fsCanvas.getContext("2d");
+  const fsSpinner= document.getElementById("fs-spinner");
+  const fsClose  = document.getElementById("fs-close");
+
+  let activeCam=null, fsOpenTime=0;
+  let player=null;
+  let isMuted=true;
+
+  const fsVolume = document.getElementById("fs-volume");
+  const fsVolLabel = document.getElementById("fs-vol-label");
+  const fsMuteBtn = document.getElementById("fs-mute");
+  const fsControls = document.getElementById("fs-controls");
+  // Начальное состояние — замутировано
+  fsMuteBtn.textContent = "🔇";
+  fsMuteBtn.classList.add("muted");
+
+  function dbToLinear(db) { return Math.pow(10, db / 20); }
+
+  function applyVolume() {
+    if (!player || !player.audioCtx) return;
+    const db = parseInt(fsVolume.value);
+    const gain = isMuted ? 0 : dbToLinear(db) * 4.0;  // 4.0 = базовое усиление
+    player.audioCtx._gain.gain.setTargetAtTime(gain, player.audioCtx.currentTime, 0.01);
+  }
+
+  fsVolume.addEventListener("input", () => {
+    fsVolLabel.textContent = fsVolume.value + " dB";
+    applyVolume();
+  });
+
+  fsMuteBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    isMuted = !isMuted;
+    fsMuteBtn.classList.toggle("muted", isMuted);
+    fsMuteBtn.textContent = isMuted ? "🔇" : "🔊";
+    applyVolume();
+  });
+  const gridItems=[];
+
+  // ── Сетка ────────────────────────────────────────────────────────────────────
+  cameras.forEach(cam => {
+    const url=`http://localhost:${cam.sub_port}/stream`;
+    const cell=document.createElement("div");
+    cell.className="cam";
+    cell.innerHTML=`<img id="img-${cam.id}" src="${url}" alt="${cam.name}" decoding="async"><div class="cam-err" id="err-${cam.id}">NO SIGNAL</div><div class="cam-label">${cam.name}</div>`;
+    gridEl.appendChild(cell);
+    const img=document.getElementById(`img-${cam.id}`);
+    const err=document.getElementById(`err-${cam.id}`);
+    const item={cam,img,err,url,retryTimer:null};
+    gridItems.push(item);
+    img.onerror=()=>{
+      if(fs.classList.contains("active"))return;
+      img.style.visibility="hidden"; err.style.display="flex";
+      item.retryTimer=setTimeout(()=>{img.style.visibility="visible";err.style.display="none";img.src=url+"?t="+Date.now();},1500);
+    };
+    cell.addEventListener("click",()=>openFs(cam));
+  });
+
+  function stopAllGrid(){ gridItems.forEach(i=>{clearTimeout(i.retryTimer);i.img.src="";}); }
+  function startAllGrid(){ gridItems.forEach(i=>{i.img.style.visibility="visible";i.err.style.display="none";i.img.src=i.url+"?t="+Date.now();}); }
+
+  // ── WebCodecs плеер ───────────────────────────────────────────────────────────
+  async function startPlayer(cam) {
+    const ws = new WebSocket(`${WS_BASE}/ws_main/${cam.id}`);
+    ws.binaryType = "arraybuffer";
+
+    let videoDecoder = null;
+    let audioCtx = null;
+    let nextAudioTime = 0;
+    let audioFmt = "mulaw";
+    let codec = "h264";
+    let codecStr = null;
+    let frameCount = 0;
+    let lastFrame = null;  // Сохраняем последний кадр для resize
+
+    const stopped = {v: false};
+
+    ws.onclose = ws.onerror = () => {
+      if (videoDecoder && videoDecoder.state !== "closed") {
+        try { videoDecoder.close(); } catch(e) {}
+      }
+    };
+
+    ws.onclose = () => {};
+
+    ws.onmessage = async (event) => {
+      if (stopped.v) return;
+
+      // Текстовое сообщение = JSON конфиг
+      if (typeof event.data === "string") {
+        const cfg = JSON.parse(event.data);
+        codec    = cfg.codec;
+        audioFmt = cfg.audio_fmt;
+        const hasAudio = cfg.has_audio;
+        // Показываем контролы только если есть звук
+        fsControls.style.display = hasAudio ? "flex" : "none";
+
+        // Скрываем спиннер — готовы к декодированию
+        fsSpinner.classList.remove("show");
+
+        // Настраиваем аудио
+        if (hasAudio) {
+          audioCtx = new AudioContext({sampleRate: 8000});
+          const gainNode = audioCtx.createGain();
+          gainNode.gain.value = 0;  // начинаем замутированным
+          gainNode.connect(audioCtx.destination);
+          audioCtx._gain = gainNode;
+          nextAudioTime = audioCtx.currentTime + 0.05;
+        }
+        return;
+      }
+
+      // Бинарное сообщение
+      const buf  = new Uint8Array(event.data);
+      const type = buf[0];
+      const data = event.data.slice(1);
+
+      if (type === 0x01 || type === 0x81) {
+        // Видео
+        const isKey = (type === 0x81);
+        const nalData = new Uint8Array(data);
+
+        if (!videoDecoder && !isKey) { return; }
+
+        if (!videoDecoder && isKey) {
+          if (codec === "hevc") {
+            codecStr = await probeHevcCodec(nalData);
+          } else {
+            codecStr = h264Codec(nalData);
+          }
+
+          videoDecoder = new VideoDecoder({
+            output: (frame) => {
+              if (stopped.v) { frame.close(); return; }
+              frameCount++;
+              if (frameCount <= 3) { 
+                // Для первых кадров устанавливаем начальный размер
+                if (frameCount === 1) {
+                  fsCanvas.width = window.innerWidth;
+                  fsCanvas.height = window.innerHeight;
+                }
+                frame.close(); 
+                return; 
+              }
+              
+              // Рисуем кадр на весь canvas
+              fsCtx.drawImage(frame, 0, 0, fsCanvas.width, fsCanvas.height);
+              
+              // Сохраняем кадр для перерисовки при resize
+              lastFrame = { bitmap: frame };
+              frame.close();
+            },
+            error: (e) => {
+                  // Сбрасываем — переинициализируем на следующем keyframe
+              videoDecoder = null;
+              codecStr = null;
+              lastFrame = null;
+            }
+          });
+
+          try {
+            const config = { codec: codecStr, optimizeForLatency: true };
+            if (codec === "hevc") {
+              const desc = extractHevcDescription(nalData);
+              if (desc) config.description = desc;
+            }
+            videoDecoder.configure(config);
+            } catch(e) {
+                videoDecoder = null; return;
+          }
+        }
+
+        if (!videoDecoder) return;
+        if (videoDecoder.state !== "configured") return;
+
+        try {
+          videoDecoder.decode(new EncodedVideoChunk({
+            type:      isKey ? "key" : "delta",
+            timestamp: performance.now() * 1000,
+            data:      nalData,
+          }));
+        } catch(e) {}
+
+      } else if (type === 0x02 && audioCtx) {
+        // Аудио G.711
+        const raw = new Uint8Array(data);
+        const pcm = (audioFmt === "alaw") ? decodeAlaw(raw) : decodeMulaw(raw);
+        const abuf = audioCtx.createBuffer(1, pcm.length, 8000);
+        abuf.getChannelData(0).set(pcm);
+
+        const now = audioCtx.currentTime;
+        if (nextAudioTime < now || nextAudioTime > now + 0.3) {
+          nextAudioTime = now + 0.02;
+        }
+        const src = audioCtx.createBufferSource();
+        src.buffer = abuf;
+        src.connect(audioCtx._gain);
+        src.start(nextAudioTime);
+        nextAudioTime += abuf.duration;
+      }
+    };
+
+    async function probeHevcCodec(nalData) {
+      const candidates = [
+        "hev1.1.6.L120.B0", "hev1.1.6.L150.B0", "hev1.1.6.L180.B0",
+        "hev1.1.6.L93.B0",  "hev1.2.4.L120.B0", "hev1.2.4.L150.B0",
+        "hvc1.1.6.L120.B0", "hvc1.1.6.L150.B0",
+        "hevc",
+      ];
+      for (const c of candidates) {
+        try {
+          const r = await VideoDecoder.isConfigSupported({
+            codec: c,
+            optimizeForLatency: true,
+          });
+          if (r.supported) {
+                  return c;
+          }
+        } catch(e) {}
+      }
+      return "hev1.1.6.L120.B0";
+    }
+
+    // Извлекаем VPS+SPS+PPS из keyframe NAL как description для VideoDecoder
+    function extractHevcDescription(nalData) {
+      // Собираем все parameter set NAL units (VPS=32, SPS=33, PPS=34)
+      const paramTypes = new Set([32, 33, 34]);
+      const units = [];
+      let i = 0;
+      while (i < nalData.length - 4) {
+        if (nalData[i]===0 && nalData[i+1]===0 && nalData[i+2]===0 && nalData[i+3]===1) {
+          const nalType = (nalData[i+4] >> 1) & 0x3F;
+          if (paramTypes.has(nalType)) {
+            // Ищем конец этого NAL unit
+            let end = nalData.length;
+            for (let j = i+4; j < nalData.length-3; j++) {
+              if (nalData[j]===0 && nalData[j+1]===0 && nalData[j+2]===0 && nalData[j+3]===1) {
+                end = j; break;
+              }
+            }
+            units.push(nalData.slice(i, end));
+          }
+          i += 4;
+        } else { i++; }
+      }
+      if (units.length === 0) return null;
+      // Конкатенируем все parameter sets
+      const total = units.reduce((s, u) => s + u.length, 0);
+      const desc = new Uint8Array(total);
+      let offset = 0;
+      for (const u of units) { desc.set(u, offset); offset += u.length; }
+      return desc;
+    }
+
+    player = {
+      ws,
+      get audioCtx() { return audioCtx; },
+      stop() {
+        stopped.v = true;
+        if (audioCtx) { try { audioCtx.close(); } catch(e) {} audioCtx = null; }
+        if (videoDecoder && videoDecoder.state !== "closed") {
+          try { videoDecoder.close(); } catch(e) {}
+        }
+        if (ws.readyState <= 1) ws.close();
+      }
+    };
+  }
+
+  // ── Fullscreen ────────────────────────────────────────────────────────────────
+  async function openFs(cam) {
+    activeCam=cam; fsOpenTime=Date.now();
+    stopAllGrid();
+    
+    // Устанавливаем размер canvas равным размеру окна
+    fsCanvas.width = window.innerWidth;
+    fsCanvas.height = window.innerHeight;
+    
+    fsCtx.clearRect(0,0,fsCanvas.width,fsCanvas.height);
+    fsSpinner.classList.add("show");
+    fs.classList.add("active");
+    fsControls.style.display = "none";  // скрываем до получения конфига
+
+    try { await fetch(`${CONTROL}/start_main?id=${cam.id}`); } catch(e) {}
+    startPlayer(cam);
+  }
+
+  async function closeFs() {
+    if (!activeCam) return;
+    const cam=activeCam; activeCam=null;
+    if (player) { player.stop(); player=null; }
+    lastFrame = null;  // Очищаем последний кадр
+    fsSpinner.classList.remove("show");
+    fs.classList.remove("active");
+    try { await fetch(`${CONTROL}/stop_main?id=${cam.id}`); } catch(e) {}
+    setTimeout(startAllGrid,300);
+  }
+
+  // Обработка изменения размера окна - canvas всегда на весь экран
+  let resizeTimeout;
+  window.addEventListener('resize', () => {
+    if (fs.classList.contains('active')) {
+      clearTimeout(resizeTimeout);
+      resizeTimeout = setTimeout(() => {
+        fsCanvas.width = window.innerWidth;
+        fsCanvas.height = window.innerHeight;
+        // Перерисовываем последний кадр если есть
+        if (lastFrame && lastFrame.bitmap) {
+          fsCtx.drawImage(lastFrame.bitmap, 0, 0, fsCanvas.width, fsCanvas.height);
+        }
+      }, 150);
+    }
+  });
+
+  fsCanvas.addEventListener("click", ()=>{ if(Date.now()-fsOpenTime>1000) closeFs(); });
+  fsClose.addEventListener("click", closeFs);
+  document.addEventListener("keydown", e=>{ if(e.key==="Escape") closeFs(); });
+
+  // ── Мониторинг сервера ────────────────────────────────────────────────────────
+  const overlay=document.getElementById("server-overlay");
+  const overlayText=document.getElementById("server-overlay-text");
+  (async function pollStatus(){
+    while(true){
+      try{
+        const r=await fetch(`${CONTROL}/status?screen=${screen_id}`,{cache:"no-store"});
+        if(r.ok){
+          const s=await r.json();
+          if(s.available){
+            if(overlay.classList.contains("show")&&!overlay.dataset.recovering){
+              overlay.dataset.recovering="1";
+              overlayText.style.color="#48bb78";
+              overlayText.style.textShadow="0 0 40px rgba(72,187,120,0.6)";
+              overlayText.textContent="Сервер доступен. Подготовка!";
+              setTimeout(()=>location.reload(),240000);
+            }
+          } else if(!overlay.dataset.recovering){
+            overlayText.style.color="#e53e3e";
+            overlayText.style.textShadow="0 0 40px rgba(229,62,62,0.6)";
+            overlayText.textContent="Нет соединения с сервером";
+            overlay.classList.add("show");
+          }
+        }
+      } catch(e){
+        if(!overlay.dataset.recovering){
+          overlayText.style.color="#e53e3e";
+          overlayText.style.textShadow="0 0 40px rgba(229,62,62,0.6)";
+          overlayText.textContent="Нет соединения с сервером";
+          overlay.classList.add("show");
+        }
+      }
+      await sleep(5000);
+    }
+  })();
+}
+
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,71 @@
+{
+  "ports": {
+    "api": 8080,
+    "sub_base": 11000,
+    "main_base": 10000
+  },
+  "sub_stream": {
+    "width": 320,
+    "height": 180,
+    "fps": 10,
+    "quality": 10
+  },
+  "main_stream": {
+    "width": 1280,
+    "height": 720,
+    "fps": 10,
+    "quality": 2,
+    "spinner_ms": 3000
+  },
+  "monitor": {
+    "check_interval": 5,
+    "connect_timeout": 3,
+    "session_interval": 240,
+    "stagger_delay": 0.5
+  },
+  "audio_enabled": false,
+  "screens": [
+    { "nvr": { "host": "10.120.204.4", "port": 80 },
+      "grid": { "columns": 4, "rows": 4      },
+      "cameras": [
+        { "name": "CAM-01",  "channel": 0, "audio": "none" },
+        { "name": "CAM-02",  "channel": 1, "audio": "none" },
+        { "name": "CAM-03",  "channel": 2 },
+        { "name": "CAM-04",  "channel": 3 },
+        { "name": "CAM-05",  "channel": 4 },
+        { "name": "CAM-06",  "channel": 5 },
+        { "name": "CAM-08",  "channel": 7 },
+        { "name": "CAM-38",  "channel": 37 },
+        { "name": "CAM-10",  "channel": 9 },
+        { "name": "CAM-11",  "channel": 10 },
+        { "name": "CAM-12",  "channel": 11 },
+        { "name": "CAM-13",  "channel": 12 },
+        { "name": "CAM-21",  "channel": 20 },
+        { "name": "CAM-35",  "channel": 34 },
+        { "name": "CAM-34",  "channel": 33 },
+        { "name": "CAM-31",  "channel": 30 }
+      ]
+    },
+    { "nvr": { "host": "10.120.204.4", "port": 80 },
+      "grid": { "columns": 4, "rows": 4 },
+      "cameras": [
+        { "name": "14", "channel": 13 },
+        { "name": "15", "channel": 14 },
+        { "name": "16", "channel": 15 },
+        { "name": "17", "channel": 16 },
+        { "name": "18", "channel": 17 },
+        { "name": "19", "channel": 18 },
+        { "name": "20", "channel": 19 },
+        { "name": "22", "channel": 21 },
+        { "name": "23", "channel": 22 },
+        { "name": "24", "channel": 23 },
+        { "name": "25", "channel": 24 },
+        { "name": "26", "channel": 25 },
+        { "name": "28", "channel": 27 },
+        { "name": "29", "channel": 28 },
+        { "name": "30", "channel": 29 },
+        { "name": "32", "channel": 31 }
+      ]
+    }
+  ]
+}
