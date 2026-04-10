@@ -15,6 +15,66 @@ from urllib.parse import urlparse, parse_qs
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
+# ── Класс для хэширования паролей HeroSpeed ──────────────────────────────────
+
+class HeroSpeedPasswordHash:
+    """
+    Вычисление хэша пароля для аутентификации HeroSpeed NVR.
+    Реализация основана на herospeed-api-session-manager.
+    """
+    
+    def __init__(self, username, password, salt, challenge, 
+                 enable_iteration=True, iterations=100, timestamp=None):
+        self.username = username
+        self.password = password
+        self.salt = salt
+        self.challenge = challenge
+        self.enable_iteration = enable_iteration
+        self.iterations = iterations
+        self.timestamp = timestamp
+    
+    @staticmethod
+    def _hex_to_latin1(hashsum):
+        """Преобразование hex digest в строку Latin-1"""
+        return bytearray.fromhex(hashsum).decode("Latin-1")
+    
+    def _round_one(self):
+        """Раунд 1: Создание base64-encoded timestamp"""
+        if self.timestamp is None:
+            self.timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        return base64.b64encode(self.timestamp.encode()).decode()
+    
+    def _round_two(self, hashsum):
+        """Раунд 2: SHA256(username + salt + timestamp_b64 + password)"""
+        string = self.username + self.salt + hashsum + self.password
+        return hashlib.sha256(string.encode()).hexdigest()
+    
+    def _round_three(self, hashsum, challenge):
+        """Раунд 3: SHA256(hex_to_latin1(hash) + challenge)"""
+        string = self._hex_to_latin1(hashsum) + challenge
+        return hashlib.sha256(string.encode("Latin-1")).hexdigest()
+    
+    def _round_four(self, hashsum):
+        """Раунд 4: Итеративное хэширование с пустым challenge"""
+        for _ in range(self.iterations):
+            hashsum = self._round_three(hashsum, "")
+        return hashsum
+    
+    def derive(self):
+        """Выполнение всех раундов обфускации пароля"""
+        hashsum = self._round_one()
+        hashsum = self._round_two(hashsum)
+        hashsum = self._round_three(hashsum, self.challenge)
+        
+        if self.enable_iteration:
+            hashsum = self._round_four(hashsum)
+        
+        return hashsum
+    
+    def get_timestamp(self):
+        """Получение использованной временной метки"""
+        return self.timestamp
+
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 
 _base_dir  = os.path.dirname(os.path.abspath(__file__))
@@ -47,7 +107,7 @@ AUDIO_ENABLED  = _cfg.get("audio_enabled", True)
 WS_HEADER_SIZE = 36
 WS_GUID        = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-# Строим камеры и экраны
+# Строим камеры and экраны
 CAMERAS, SCREENS = [], []
 _cam_id = 0
 for _si, _sc in enumerate(_cfg["screens"]):
@@ -90,10 +150,6 @@ nvr_available = {n["nvr_host"]: threading.Event()  for n in NVR_HOSTS}
 nvr_session   = {n["nvr_host"]: None               for n in NVR_HOSTS}
 nvr_sess_lock = {n["nvr_host"]: threading.Lock()   for n in NVR_HOSTS}
 
-# Индивидуальные сессии для каждой камеры (на основе общей сессии NVR)
-camera_sessions = {}
-camera_sessions_lock = threading.Lock()
-
 sub_processes = {}; proc_lock = threading.Lock()
 
 # ── Авторизация ───────────────────────────────────────────────────────────────
@@ -105,79 +161,118 @@ def _sha256(s):
 def _hex_to_str(h):
     return ''.join(chr(int(h[i:i+2],16)) for i in range(0,len(h),2))
 
-def nvr_login(nvr_http, nvr_host, user, password):
+def nvr_login(nvr_http, nvr_host, user, password, force_logout=False):
+    """
+    HeroSpeed двухэтапная аутентификация с использованием класса HeroSpeedPasswordHash.
+    Реализация основана на herospeed-api-session-manager.
+    
+    Args:
+        force_logout: Если True, закрывает старую сессию перед созданием новой.
+                     Если False (по умолчанию), просто обновляет сессию без logout.
+    """
     try:
+        # Шаг 0: Закрытие старой сессии ТОЛЬКО если явно запрошено
+        if force_logout:
+            old_session = get_session(nvr_host)
+            if old_session:
+                log(f"[auth:{nvr_host}] Закрытие старой сессии: {old_session[:16]}...")
+                session_logout(nvr_http, nvr_host, f"sessionID={old_session}")
+        
+        # Шаг 1: Получение возможностей входа (challenge, salt, iterations)
         r = requests.post(f"{nvr_http}/api/session/login-capabilities",
                           json={"action":"get"}, timeout=5)
         d = r.json()["data"]
-        sid=d["sessionID"]; challenge=d["param"]["challenge"]
-        salt=d["param"]["salt"]; iters=d["param"]["iterations"]
-        now=datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        dt_b64=base64.b64encode(now.encode()).decode()
-        h=_sha256(user+salt+dt_b64+password)
-        h=_sha256(_hex_to_str(h)+challenge)
-        for _ in range(iters): h=_sha256(_hex_to_str(h))
+        sid=d["sessionID"]
+        challenge=d["param"]["challenge"]
+        salt=d["param"]["salt"]
+        iters=d["param"]["iterations"]
+        enable_iteration=d["param"].get("enableIteration", True)
+        
+        # Используем класс HeroSpeedPasswordHash для вычисления хэша
+        hasher = HeroSpeedPasswordHash(
+            username=user,
+            password=password,
+            salt=salt,
+            challenge=challenge,
+            enable_iteration=enable_iteration,
+            iterations=iters
+        )
+        
+        password_hash = hasher.derive()
+        now = hasher.get_timestamp()
+        
+        # Шаг 2: Выполнение входа с вычисленным хэшем
         r2=requests.post(f"{nvr_http}/api/session/login",
             json={"action":"set","data":{"username":user,"loginEncryptionType":"sha256-1",
-            "password":h,"sessionID":sid,"datetime":now}}, timeout=5)
+            "password":password_hash,"sessionID":sid,"datetime":now}}, timeout=5)
         data=r2.json()
-        if data["code"]!=0: log(f"[auth:{nvr_host}] Ошибка code={data['code']}"); return None
+        if data["code"]!=0: 
+            log(f"[auth:{nvr_host}] Ошибка code={data['code']} msg={data.get('msg','unknown')}")
+            return None
         _,val=data["data"]["cookie"].split("=")
         with nvr_sess_lock[nvr_host]: nvr_session[nvr_host]=val
-        log(f"[auth:{nvr_host}] Сессия: {val[:16]}...")
+        log(f"[auth:{nvr_host}] Новая сессия: {val[:16]}... (итераций: {iters}, enable_iter: {enable_iteration})")
         return val
     except Exception as e:
-        log(f"[auth:{nvr_host}] Ошибка: {e}"); return None
+        log(f"[auth:{nvr_host}] Ошибка: {type(e).__name__}: {e}")
+        import traceback
+        log(f"[auth:{nvr_host}] Трассировка: {traceback.format_exc()}")
+        return None
 
 def get_session(nvr_host):
     """Получить сессию для NVR"""
     with nvr_sess_lock[nvr_host]: return nvr_session[nvr_host]
 
+def session_logout(nvr_http, nvr_host, session_cookie):
+    """Завершение сессии HeroSpeed NVR"""
+    try:
+        url = f"{nvr_http}/api/session/logout"
+        data = {"action": "set", "data": {"cookie": session_cookie}}
+        headers = {
+            "Content-Type": "application/json; charset=UTF-8",
+            "Cookie": session_cookie
+        }
+        r = requests.post(url, json=data, headers=headers, timeout=5)
+        if r.status_code == 200:
+            log(f"[auth:{nvr_host}] Сессия завершена")
+        return True
+    except Exception as e:
+        log(f"[auth:{nvr_host}] Ошибка logout: {e}")
+        return False
+
+def session_verify(nvr_http, nvr_host, session_cookie):
+    """Проверка валидности сессии через heartbeat"""
+    try:
+        url = f"{nvr_http}/api/session/heart-beat"
+        data = {"operaType": "checkSessionHeart"}
+        headers = {
+            "Content-Type": "application/json; charset=UTF-8",
+            "Cookie": session_cookie
+        }
+        r = requests.post(url, json=data, headers=headers, timeout=5)
+        return r.status_code == 200
+    except Exception as e:
+        log(f"[auth:{nvr_host}] Ошибка verify: {e}")
+        return False
+
 def session_keeper(nvr_http, nvr_host, user, password):
-    """Периодическое обновление сессии NVR"""
+    """Периодическое обновление сессии NVR с проверкой heartbeat"""
     while True:
-        nvr_login(nvr_http, nvr_host, user, password)
+        # Обновляем сессию БЕЗ закрытия старой (force_logout=False)
+        session = nvr_login(nvr_http, nvr_host, user, password, force_logout=False)
+        if session:
+            # Проверяем сессию через heartbeat
+            is_valid = session_verify(nvr_http, nvr_host, f"sessionID={session}")
+            if not is_valid:
+                log(f"[auth:{nvr_host}] Сессия невалидна, повторная авторизация...")
         time.sleep(SESSION_INTERVAL)
 
 def get_camera_session(cam, nvr_http, user, password):
-    """Получить индивидуальную сессию для камеры на основе общей сессии NVR"""
-    cam_key = f"{cam['nvr_host']}:{cam['channel']}"
-    with camera_sessions_lock:
-        if cam_key in camera_sessions:
-            return camera_sessions[cam_key]
-    
-    # Сначала пробуем взять уже существующую общую сессию NVR (без новой авторизации!)
-    session = get_session(cam['nvr_host'])
-    
-    # Если общей сессии еще нет (камера запустилась раньше чем основная авторизация)
-    if not session:
-        # Делаем индивидуальную авторизацию только для этой камеры
-        session = nvr_login(nvr_http, cam['nvr_host'], user, password)
-    
-    if session:
-        with camera_sessions_lock:
-            camera_sessions[cam_key] = session
-        log(f"[auth:cam{cam['id']:02d}] Индивидуальная сессия: {session[:16]}...")
-    return session
-
-def camera_session_refresh(cam, nvr_http, user, password):
-    """Периодическое обновление индивидуальной сессии камеры"""
-    cam_key = f"{cam['nvr_host']}:{cam['channel']}"
-    while True:
-        time.sleep(SESSION_INTERVAL)
-        
-        # Проверяем текущую сессию
-        with camera_sessions_lock:
-            current_session = camera_sessions.get(cam_key)
-        
-        # Если сессии нет или она отличается от текущей общей - обновляем
-        common_session = get_session(cam['nvr_host'])
-        if not common_session or (current_session and current_session != common_session):
-            session = nvr_login(nvr_http, cam['nvr_host'], user, password)
-            if session:
-                with camera_sessions_lock:
-                    camera_sessions[cam_key] = session
-                log(f"[auth:cam{cam['id']:02d}] Сессия обновлена: {session[:16]}...")
+    """
+    Получить ОБЩУЮ сессию NVR для камеры.
+    Все камеры одного NVR используют одну и ту же сессию.
+    """
+    return get_session(cam['nvr_host'])
 
 # ── Мониторинг ────────────────────────────────────────────────────────────────
 
@@ -223,7 +318,7 @@ def kill_all_subs():
     with frames_lock:
         for k in sub_frames: sub_frames[k]=None
 
-# ── Детекция кодека и аудио ───────────────────────────────────────────────────
+# ── Детекция кодека and аудио ───────────────────────────────────────────────────
 
 def _detect_codec(nal):
     idx=nal.find(bytes([0,0,0,1]))
@@ -232,7 +327,7 @@ def _detect_codec(nal):
     return "hevc" if (nb>>1)&0x3F in (32,33,34) else "h264"
 
 def _is_keyframe(nal, codec):
-    """Ищем IDR NAL по start code 00 00 00 01 или 00 00 01"""
+    """Ищем IDR NAL по start code 00 00 00 01 or 00 00 01"""
     for sc, offset in ((bytes([0,0,0,1]), 4), (bytes([0,0,1]), 3)):
         idx = 0
         while True:
@@ -348,7 +443,7 @@ class WSProxySession:
             ws.send(json.dumps({"action":"play",
                 "data":{"channel":cam["channel"],"stream":0,"sessionID":session}}))
 
-            # Зондируем 2 сек: определяем кодек и наличие аудио
+            # Зондируем 2 сек: определяем кодек and наличие аудио
             codec=None; has_audio=False; audio_hdr=None
             vq=[]; aq=[]
 
@@ -582,7 +677,7 @@ def _ws_feed(nvr_ws,channel,stream_no,proc_holder,scale,q,fps,session,stop_event
             if not isinstance(data,bytes) or len(data)<=WS_HEADER_SIZE: 
                 continue
             if data[4]!=1: 
-                # Это аудио или другие данные - логируем только первые разы
+                # Это аудио or другие данные - логируем только первые разы
                 if recv_count <= 3:
                     log(f"[ws_feed] Канал {channel}: тип пакета={data[4]} (не видео), всего получено: {recv_count}")
                 continue
@@ -633,9 +728,6 @@ def capture_sub(cam):
     nvr_http=cam["nvr_http"]; nvr_user=cam["nvr_user"]; nvr_pass=cam["nvr_pass"]
     restart_count = 0
     stream_to_try = 1  # Всегда используем только суб-поток
-    
-    # Запускаем отдельный session keeper для ЭТОЙ камеры
-    threading.Thread(target=camera_session_refresh, args=(cam, nvr_http, nvr_user, nvr_pass), daemon=True).start()
     
     while True:
         # Получаем индивидуальную сессию для этой камеры (полная авторизация)
@@ -849,9 +941,28 @@ def start_control_server():
     srv.serve_forever()
 
 def shutdown(sig,frame):
-    log("Остановка..."); kill_all_subs(); kill_all_main()
+    """Корректное завершение работы с закрытием всех сессий NVR"""
+    log("Остановка... Закрытие всех сессий NVR...")
+    
+    # Закрываем все активные сессии NVR (одна на каждый NVR)
+    for nvr_host, session in nvr_session.items():
+        if session:
+            try:
+                log(f"[auth:{nvr_host}] Закрытие сессии при остановке: {session[:16]}...")
+                # Находим соответствующий NVR для получения HTTP URL
+                for nvr in NVR_HOSTS:
+                    if nvr["nvr_host"] == nvr_host:
+                        session_logout(nvr["nvr_http"], nvr_host, f"sessionID={session}")
+                        break
+            except Exception as e:
+                log(f"[auth:{nvr_host}] Ошибка при закрытии сессии: {e}")
+    
+    # Останавливаем все процессы
+    kill_all_subs(); kill_all_main()
     try: subprocess.run(["pkill","-9","-f","ffmpeg.*pipe"],timeout=3)
     except: pass
+    
+    log("Все сессии закрыты. Выход.")
     sys.exit(0)
 
 if __name__=="__main__":
@@ -863,7 +974,7 @@ if __name__=="__main__":
     _unique_hosts = [nvr["nvr_host"] for nvr in NVR_HOSTS]
     log(f"[config] Уникальные NVR хосты: {', '.join(_unique_hosts)} (всего: {len(_unique_hosts)})")
 
-    # Авторизация и запуск session keeper для каждого уникального NVR
+    # Авторизация and запуск session keeper для каждого уникального NVR
     for nvr in NVR_HOSTS:
         h=nvr["nvr_host"]; p=nvr["nvr_port"]
         log(f"[auth:{h}] Логин...")

@@ -1,8 +1,19 @@
-# Credentials and sensitive data
+# Чувствительные данные
 credentials.json
 *.pem
 *.key
 *.secret
+
+# Временные файлы и результаты тестов
+*.txt
+*.pcap
+channel_test_results.txt
+substream_test_results.txt
+working_rtsp_url.txt
+
+# Тестовые скрипты (опционально, можно убрать если нужны в репо)
+test_*.py
+test_*.sh
 
 # Python
 __pycache__/
